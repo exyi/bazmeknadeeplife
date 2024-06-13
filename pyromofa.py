@@ -1,3 +1,4 @@
+import time
 import numpy as np
 import pyro, pyro.distributions, pyro.optim, pyro.infer
 from pyro.nn import PyroSample, PyroModule
@@ -7,6 +8,7 @@ from sklearn.metrics import mean_squared_error
 import random, math, os, re, sys
 import typing as ty
 import dataclasses
+import scipy.sparse
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # device = torch.device("cpu")
@@ -17,6 +19,63 @@ def to_device(t): return torch.tensor(t).to(device)
 class MOFAMatrices:
     Z: torch.Tensor
     Ws: dict[str, torch.Tensor]
+
+def to_torch_sparse(matrix: scipy.sparse.csr_matrix, device: torch.device = torch.device("cpu")) -> torch.Tensor:
+    return torch.sparse_csr_tensor(matrix.indptr, matrix.indices, matrix.data, size=matrix.shape, device=device)
+
+def get_mask(t: ty.Union[torch.Tensor, scipy.sparse.csr_matrix]) -> ty.Optional[torch.Tensor]:
+    """Returns a mask with False where NaNs are presents. Return None, if there are no NaNs in the entire tensor"""
+    if isinstance(t, scipy.sparse.csr_matrix):
+        m = torch.isnan(to_torch_sparse(t))
+        if torch.any(m.values()):
+            return m.to_dense()
+    else:
+        m = torch.isnan(t)
+        if torch.any(m):
+            return m
+    return None
+
+#this does not work well for our batch sizes, just in case it comes in handy later:
+# def torch_sparse_select_rows(tensor: torch.Tensor, ix: list[int] | torch.Tensor):
+#     if not tensor.is_sparse_csr:
+#         return tensor[ix]
+
+#     ixt = torch.tensor(ix, device=tensor.device, dtype=torch.long)
+
+#     crow = tensor.crow_indices()
+#     rows_start = crow[ixt]
+#     rows_end = crow[ixt+1]
+#     rows_len = rows_end - rows_start
+#     values = tensor.values()
+#     new_values = torch.cat([
+#         values[rows_start[i]:rows_end[i]] for i in range(len(ix))
+#     ])
+#     col_indices = tensor.col_indices()
+#     new_cols = torch.cat([
+#         col_indices[rows_start[i]:rows_end[i]] for i in range(len(ix))
+#     ])
+
+#     new_crow = torch.zeros(len(ix)+1, device=tensor.device, dtype=crow.dtype)
+#     torch.cumsum(rows_len, dim=0, out=new_crow[1:])
+#     return torch.sparse_csr_tensor(new_crow, new_cols, new_values, size=(len(ix), tensor.size(1)))
+# print(rna_tensor.shape)
+# print(rna.X.shape)
+# print(rna.X[3].toarray())
+# torch_sparse_select_rows(rna_tensor, [1]).to_dense()
+
+def maybe_sparse_tensor(t):
+    if isinstance(t, scipy.sparse.csr_matrix):
+        return to_torch_sparse(t)
+    if isinstance(t, torch.Tensor):
+        return t
+    return torch.tensor(t)
+
+def replace_nans(x: ty.Union[torch.Tensor, scipy.sparse.csr_matrix], nan: float):
+    if isinstance(x, scipy.sparse.csr_matrix):
+        x.data = np.nan_to_num(x.data, nan=nan)
+        return x
+    else:
+        return torch.nan_to_num(x, nan=nan)
 
 class MOFA(PyroModule):
     def __init__(self, Ys: dict[str, torch.Tensor], K, batch_size=128, Guide: type[autoguide.AutoGuide] = autoguide.AutoNormal):
@@ -29,15 +88,16 @@ class MOFA(PyroModule):
         pyro.clear_param_store()
 
         self.K = K  # number of factors 
-        self.empirical_means = { m: Y.mean(dim=0)
+        self.empirical_means = { m: torch.tensor(Y.mean(axis=0)) if isinstance(Y, scipy.sparse.csr_matrix) else Y.mean(dim=0)
                                  for m, Y in Ys.items() }
-        self.empirical_stds = { m: torch.clamp(torch.std(Y, dim=0), 1)
+        self.empirical_stds = { m: 1 if isinstance(Y, scipy.sparse.csr_matrix) else torch.clamp(torch.std(Y, dim=0),1)
                                 for m, Y in Ys.items() }
 
-        self.obs_masks = { m: torch.logical_not(torch.isnan(Y))
+        self.obs_masks = { m: get_mask(Y)
                            for m, Y in Ys.items()}
+        print(f"Observation masks: {self.obs_masks}")
         # a valid value for the NAs has to be defined even though these samples will be ignored later
-        self.Ys = { m: torch.nan_to_num(Y, nan=0)
+        self.Ys = { m: replace_nans(Y, nan=0)
                     for m, Y in Ys.items()}  # data/observations
         
         # assert sample dim same in Ys
@@ -51,7 +111,13 @@ class MOFA(PyroModule):
         
         self.latent_factor_plate = pyro.plate("latent factors", self.K)
         self.Guide = Guide
-        
+
+    def get_sample_batch(self, m, indices):
+        Y = self.Ys[m][indices]
+        if isinstance(Y, scipy.sparse.csr_matrix):
+            return to_torch_sparse(Y, device=device).to_dense()
+        return Y.to(device)
+
     def model(self):
         """ Creates the model.
         
@@ -101,10 +167,15 @@ class MOFA(PyroModule):
                 scale_tau = 0.001 + pyro.sample(f"scale_{m}", pyro.distributions.LogNormal(to_device(0.), 1.))
                 
                 with sample_plate as sub_indices:
-                    Y, Y_hat = self.Ys[m][sub_indices, :], Y_hats[m]
-                    
                     # masking the NA values such that they are not considered in the distributions
-                    obs_mask = self.obs_masks[m][sub_indices, :]                    
+                    obs_mask = self.obs_masks[m]
+                    if obs_mask is None:
+                        obs_mask = True
+                    else:
+                        obs_mask = obs_mask[sub_indices, :]
+
+                    Y, Y_hat = self.get_sample_batch(m, sub_indices), Y_hats[m]
+
                     with pyro.poutine.mask(mask=obs_mask): #type: ignore
                         # # sample scale parameter for each feature-sample pair with LogNormal prior (has to be positive)
                         # scale = pyro.sample(f"scale_{m}", pyro.distributions.LogNormal(to_device(0., 1.)))
@@ -119,11 +190,12 @@ class MOFA(PyroModule):
                         # print(r[:5, :5], p[:5, :5], Y[:5, :5])
                         # pyro.sample(f"obs_{m}", pyro.distributions.NegativeBinomial(r, p), obs=Y)
 
-    def train(self, num_iterations = 4000):
+    def train(self, lr=0.002, num_iterations = 4000):
         # set training parameters
-        optimizer = pyro.optim.Adam({"lr": 0.002})
+        optimizer = pyro.optim.Adam({"lr": lr})
         elbo = pyro.infer.Trace_ELBO()
         guide = self.Guide(self.model)
+        t0 = time.time()
         # guide = autoguide.AutoDelta(self.model)
         
         # initialize stochastic variational inference
@@ -142,7 +214,7 @@ class MOFA(PyroModule):
 
             train_loss.append(loss/self.num_samples)
             if j % 200 == 0:
-                print("[iteration %04d] loss: %.4f" % (j + 1, loss / self.num_samples))
+                print("[%02d:%02.1d iteration %05d] loss: %.4f" % (round((time.time() - t0)/60), round(time.time() - t0, ndigits=1) % 60, j + 1, loss / self.num_samples))
         
         # Obtain maximum a posteriori estimates for W and Z
         # map_estimates = guide(self.Y)  # not sure why needed Y?
